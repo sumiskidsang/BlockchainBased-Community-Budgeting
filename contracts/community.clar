@@ -202,3 +202,79 @@
 (define-private (is-registered)
   (default-to false (get registered (map-get? users tx-sender)))
 )
+
+(define-map project-milestones 
+  { project-id: uint }
+  {
+    total-milestones: uint,
+    completed-milestones: uint,
+    amount-per-milestone: uint
+  }
+)
+
+(define-public (add-project-milestones (project-id uint) (milestone-count uint))
+  (let
+    (
+      (project (unwrap! (map-get? projects project-id) ERR_PROJECT_NOT_FOUND))
+      (amount-per-mile (/ (get requested-amount project) milestone-count))
+    )
+    (asserts! (is-admin) ERR_UNAUTHORIZED)
+    (asserts! (> milestone-count u0) ERR_INVALID_AMOUNT)
+    (map-set project-milestones
+      { project-id: project-id }
+      {
+        total-milestones: milestone-count,
+        completed-milestones: u0,
+        amount-per-milestone: amount-per-mile
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (complete-milestone (project-id uint))
+  (let
+    (
+      (project (unwrap! (map-get? projects project-id) ERR_PROJECT_NOT_FOUND))
+      (milestones (unwrap! (map-get? project-milestones { project-id: project-id }) ERR_PROJECT_NOT_FOUND))
+    )
+    (asserts! (is-admin) ERR_UNAUTHORIZED)
+    (asserts! (< (get completed-milestones milestones) (get total-milestones milestones)) ERR_INVALID_AMOUNT)
+    
+    (map-set project-milestones
+      { project-id: project-id }
+      (merge milestones { completed-milestones: (+ (get completed-milestones milestones) u1) })
+    )
+    (ok true)
+  )
+)
+
+
+(define-constant CATEGORY_INFRASTRUCTURE u1)
+(define-constant CATEGORY_EDUCATION u2)
+(define-constant CATEGORY_ENVIRONMENT u3)
+(define-constant CATEGORY_TECHNOLOGY u4)
+
+(define-map project-categories uint uint)
+
+(define-public (set-project-category (project-id uint) (category uint))
+  (let
+    (
+      (project (unwrap! (map-get? projects project-id) ERR_PROJECT_NOT_FOUND))
+    )
+    (asserts! (is-admin) ERR_UNAUTHORIZED)
+    (asserts! (or 
+      (is-eq category CATEGORY_INFRASTRUCTURE)
+      (is-eq category CATEGORY_EDUCATION)
+      (is-eq category CATEGORY_ENVIRONMENT)
+      (is-eq category CATEGORY_TECHNOLOGY)
+    ) ERR_INVALID_AMOUNT)
+    
+    (map-set project-categories project-id category)
+    (ok true)
+  )
+)
+
+;; (define-read-only (get-projects-by-category (category uint))
+;;   (filter (lambda (project) (is-eq (get-category (get project-id project)) category)) projects)
+;; )
