@@ -278,3 +278,209 @@
 ;; (define-read-only (get-projects-by-category (category uint))
 ;;   (filter (lambda (project) (is-eq (get-category (get project-id project)) category)) projects)
 ;; )
+
+(define-constant REPUTATION_PROPOSAL_BONUS u10)
+(define-constant REPUTATION_VOTE_BONUS u2)
+(define-constant REPUTATION_COMPLETION_BONUS u25)
+(define-constant REPUTATION_CANCELLATION_PENALTY u15)
+
+(define-map user-reputation principal
+  {
+    total-score: uint,
+    proposals-created: uint,
+    votes-cast: uint,
+    projects-completed: uint,
+    projects-cancelled: uint
+  }
+)
+
+(define-map reputation-history
+  {
+    user: principal,
+    action-id: uint
+  }
+  {
+    action-type: (string-ascii 20),
+    points-change: int,
+    timestamp: uint,
+    related-project: (optional uint)
+  }
+)
+
+(define-data-var reputation-action-count uint u0)
+
+(define-private (get-user-reputation-data (user principal))
+  (default-to 
+    {
+      total-score: u0,
+      proposals-created: u0,
+      votes-cast: u0,
+      projects-completed: u0,
+      projects-cancelled: u0
+    }
+    (map-get? user-reputation user)
+  )
+)
+
+(define-private (award-reputation (user principal) (points uint) (action-type (string-ascii 20)) (project-id (optional uint)))
+  (let
+    (
+      (current-rep (get-user-reputation-data user))
+      (action-id (var-get reputation-action-count))
+    )
+    (map-set user-reputation user
+      (merge current-rep { total-score: (+ (get total-score current-rep) points) })
+    )
+    (map-set reputation-history
+      { user: user, action-id: action-id }
+      {
+        action-type: action-type,
+        points-change: (to-int points),
+        timestamp: stacks-block-height,
+        related-project: project-id
+      }
+    )
+    (var-set reputation-action-count (+ action-id u1))
+    (ok { code: u0 })
+  )
+)
+
+(define-private (deduct-reputation (user principal) (points uint) (action-type (string-ascii 20)) (project-id (optional uint)))
+  (let
+    (
+      (current-rep (get-user-reputation-data user))
+      (action-id (var-get reputation-action-count))
+      (current-score (get total-score current-rep))
+      (new-score (if (>= current-score points) (- current-score points) u0))
+    )
+    (map-set user-reputation user
+      (merge current-rep { total-score: new-score })
+    )
+    (map-set reputation-history
+      { user: user, action-id: action-id }
+      {
+        action-type: action-type,
+        points-change: (- (to-int points)),
+        timestamp: stacks-block-height,
+        related-project: project-id
+      }
+    )
+    (var-set reputation-action-count (+ action-id u1))
+    (ok true)
+  )
+)
+
+(define-public (propose-project-with-reputation (name (string-ascii 50)) (description (string-ascii 500)) (amount uint))
+  (let
+    (
+      (project-id (var-get project-count))
+      (current-rep (get-user-reputation-data tx-sender))
+    )
+    (asserts! (is-registered) ERR_UNAUTHORIZED)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (var-get voting-open) ERR_VOTING_CLOSED)
+    
+    (var-set project-count (+ project-id u1))
+    (map-set projects project-id {
+      name: name,
+      description: description,
+      requested-amount: amount,
+      votes: u0,
+      active: true,
+      funded: false,
+      creator: tx-sender
+    })
+    (map-set project-id-to-index project-id project-id)
+    (map-set user-reputation tx-sender
+      (merge current-rep { proposals-created: (+ (get proposals-created current-rep) u1) })
+    )
+    ;; (try! (award-reputation tx-sender REPUTATION_PROPOSAL_BONUS "proposal" (some project-id)))
+    (ok project-id)
+  )
+)
+
+(define-public (vote-for-project-with-reputation (project-id uint))
+  (let
+    (
+      (project (unwrap! (map-get? projects project-id) ERR_PROJECT_NOT_FOUND))
+      (vote-key {project-id: project-id, voter: tx-sender})
+      (current-rep (get-user-reputation-data tx-sender))
+    )
+    (asserts! (is-citizen) ERR_UNAUTHORIZED)
+    (asserts! (var-get voting-open) ERR_VOTING_CLOSED)
+    (asserts! (get active project) ERR_PROJECT_INACTIVE)
+    (asserts! (is-none (map-get? project-votes vote-key)) ERR_ALREADY_VOTED)
+    
+    (map-set project-votes vote-key {voted: true})
+    (map-set projects project-id (merge project {votes: (+ (get votes project) u1)}))
+    (map-set user-reputation tx-sender
+      (merge current-rep { votes-cast: (+ (get votes-cast current-rep) u1) })
+    )
+    ;; (try! (award-reputation tx-sender REPUTATION_VOTE_BONUS "vote" (some project-id)))
+    (ok true)
+  )
+)
+
+(define-public (mark-project-completed (project-id uint))
+  (let
+    (
+      (project (unwrap! (map-get? projects project-id) ERR_PROJECT_NOT_FOUND))
+      (creator (get creator project))
+      (current-rep (get-user-reputation-data creator))
+    )
+    (asserts! (is-admin) ERR_UNAUTHORIZED)
+    (asserts! (get funded project) ERR_PROJECT_INACTIVE)
+    
+    (map-set user-reputation creator
+      (merge current-rep { projects-completed: (+ (get projects-completed current-rep) u1) })
+    )
+    ;; (try! (award-reputation creator REPUTATION_COMPLETION_BONUS "completion" (some project-id)))
+    (ok true)
+  )
+)
+
+(define-public (cancel-project-with-reputation (project-id uint))
+  (let
+    (
+      (project (unwrap! (map-get? projects project-id) ERR_PROJECT_NOT_FOUND))
+      (creator (get creator project))
+      (current-rep (get-user-reputation-data creator))
+    )
+    (asserts! (or (is-admin) (is-eq tx-sender creator)) ERR_UNAUTHORIZED)
+    (asserts! (not (get funded project)) ERR_ALREADY_FUNDED)
+    
+    (map-set projects project-id (merge project {active: false}))
+    (map-set user-reputation creator
+      (merge current-rep { projects-cancelled: (+ (get projects-cancelled current-rep) u1) })
+    )
+    ;; (try! (deduct-reputation creator REPUTATION_CANCELLATION_PENALTY "cancellation" (some project-id)))
+    (ok true)
+  )
+)
+
+(define-read-only (get-user-reputation (user principal))
+  (get-user-reputation-data user)
+)
+
+(define-read-only (get-user-reputation-score (user principal))
+  (get total-score (get-user-reputation-data user))
+)
+
+(define-read-only (get-reputation-history (user principal) (action-id uint))
+  (map-get? reputation-history { user: user, action-id: action-id })
+)
+
+(define-read-only (is-trusted-user (user principal))
+  (>= (get-user-reputation-score user) u50)
+)
+
+(define-read-only (get-reputation-multiplier (user principal))
+  (let
+    (
+      (score (get-user-reputation-score user))
+    )
+    (if (>= score u100) u3
+      (if (>= score u50) u2 u1)
+    )
+  )
+)
