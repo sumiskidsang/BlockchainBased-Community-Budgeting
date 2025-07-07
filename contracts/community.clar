@@ -484,3 +484,211 @@
     )
   )
 )
+
+(define-constant ERR_DELEGATION_NOT_FOUND (err u110))
+(define-constant ERR_ALREADY_DELEGATED (err u111))
+(define-constant ERR_SELF_DELEGATION (err u112))
+(define-constant ERR_DELEGATION_REVOKED (err u113))
+(define-constant ERR_INSUFFICIENT_REPUTATION (err u114))
+
+(define-map user-delegations principal
+  {
+    delegate: principal,
+    active: bool,
+    voting-power: uint
+  }
+)
+
+(define-map delegate-vote-counts principal uint)
+
+(define-public (delegate-voting-power (delegate principal) (voting-power uint))
+  (let
+    (
+      (delegator-rep (get-user-reputation-score tx-sender))
+      (max-delegation (/ delegator-rep u10))
+    )
+    (asserts! (>= delegator-rep u30) ERR_INSUFFICIENT_REPUTATION)
+    (asserts! (not (is-eq tx-sender delegate)) ERR_SELF_DELEGATION)
+    (asserts! (is-citizen) ERR_UNAUTHORIZED)
+    (asserts! (is-registered) ERR_UNAUTHORIZED)
+    (asserts! (<= voting-power max-delegation) ERR_INVALID_AMOUNT)
+    (asserts! (> voting-power u0) ERR_INVALID_AMOUNT)
+    (asserts! (is-none (map-get? user-delegations tx-sender)) ERR_ALREADY_DELEGATED)
+    
+    (map-set user-delegations tx-sender {
+      delegate: delegate,
+      active: true,
+      voting-power: voting-power
+    })
+    (map-set delegate-vote-counts delegate 
+      (+ (default-to u0 (map-get? delegate-vote-counts delegate)) voting-power))
+    (ok true)
+  )
+)
+
+(define-public (revoke-delegation)
+  (let
+    (
+      (delegation (unwrap! (map-get? user-delegations tx-sender) ERR_DELEGATION_NOT_FOUND))
+      (delegate (get delegate delegation))
+      (voting-power (get voting-power delegation))
+    )
+    (asserts! (get active delegation) ERR_DELEGATION_REVOKED)
+    
+    (map-set user-delegations tx-sender (merge delegation {active: false}))
+    (map-set delegate-vote-counts delegate 
+      (- (default-to u0 (map-get? delegate-vote-counts delegate)) voting-power))
+    (ok true)
+  )
+)
+
+(define-public (vote-with-delegation (project-id uint) (delegator principal))
+  (let
+    (
+      (project (unwrap! (map-get? projects project-id) ERR_PROJECT_NOT_FOUND))
+      (delegation (unwrap! (map-get? user-delegations delegator) ERR_DELEGATION_NOT_FOUND))
+      (vote-key {project-id: project-id, voter: delegator})
+      (voting-power (get voting-power delegation))
+    )
+    (asserts! (is-citizen) ERR_UNAUTHORIZED)
+    (asserts! (var-get voting-open) ERR_VOTING_CLOSED)
+    (asserts! (get active project) ERR_PROJECT_INACTIVE)
+    (asserts! (get active delegation) ERR_DELEGATION_REVOKED)
+    (asserts! (is-eq tx-sender (get delegate delegation)) ERR_UNAUTHORIZED)
+    (asserts! (is-none (map-get? project-votes vote-key)) ERR_ALREADY_VOTED)
+    
+    (map-set project-votes vote-key {voted: true})
+    (map-set projects project-id (merge project {votes: (+ (get votes project) voting-power)}))
+    (ok true)
+  )
+)
+
+(define-read-only (get-user-delegation (user principal))
+  (map-get? user-delegations user)
+)
+
+(define-read-only (get-delegate-vote-count (delegate principal))
+  (default-to u0 (map-get? delegate-vote-counts delegate))
+)
+
+(define-read-only (get-max-delegation-power (user principal))
+  (/ (get-user-reputation-score user) u10)
+)
+
+(define-constant ERR_ESCROW_NOT_FOUND (err u115))
+(define-constant ERR_ESCROW_ALREADY_EXISTS (err u116))
+(define-constant ERR_ESCROW_LOCKED (err u117))
+(define-constant ERR_ESCROW_RELEASED (err u118))
+(define-constant ERR_INSUFFICIENT_ESCROW (err u119))
+
+(define-map project-escrow uint
+  {
+    total-amount: uint,
+    released-amount: uint,
+    locked: bool,
+    release-deadline: uint,
+    creator: principal,
+    escrow-active: bool
+  }
+)
+
+(define-public (create-escrow (project-id uint) (deadline-blocks uint))
+  (let
+    (
+      (project (unwrap! (map-get? projects project-id) ERR_PROJECT_NOT_FOUND))
+      (requested-amount (get requested-amount project))
+      (creator (get creator project))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-admin) ERR_UNAUTHORIZED)
+    (asserts! (get funded project) ERR_PROJECT_INACTIVE)
+    (asserts! (is-none (map-get? project-escrow project-id)) ERR_ESCROW_ALREADY_EXISTS)
+    (asserts! (> deadline-blocks u0) ERR_INVALID_AMOUNT)
+    
+    (map-set project-escrow project-id {
+      total-amount: requested-amount,
+      released-amount: u0,
+      locked: true,
+      release-deadline: (+ current-block deadline-blocks),
+      creator: creator,
+      escrow-active: true
+    })
+    (ok true)
+  )
+)
+
+(define-public (release-escrow-funds (project-id uint) (amount uint))
+  (let
+    (
+      (escrow (unwrap! (map-get? project-escrow project-id) ERR_ESCROW_NOT_FOUND))
+      (total-amount (get total-amount escrow))
+      (released-amount (get released-amount escrow))
+      (available-amount (- total-amount released-amount))
+    )
+    (asserts! (is-admin) ERR_UNAUTHORIZED)
+    (asserts! (get escrow-active escrow) ERR_ESCROW_RELEASED)
+    (asserts! (get locked escrow) ERR_ESCROW_LOCKED)
+    (asserts! (<= amount available-amount) ERR_INSUFFICIENT_ESCROW)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    
+    (map-set project-escrow project-id 
+      (merge escrow { released-amount: (+ released-amount amount) })
+    )
+    (ok amount)
+  )
+)
+
+(define-public (unlock-escrow (project-id uint))
+  (let
+    (
+      (escrow (unwrap! (map-get? project-escrow project-id) ERR_ESCROW_NOT_FOUND))
+      (current-block stacks-block-height)
+      (deadline (get release-deadline escrow))
+    )
+    (asserts! (or (is-admin) (is-eq tx-sender (get creator escrow))) ERR_UNAUTHORIZED)
+    (asserts! (get escrow-active escrow) ERR_ESCROW_RELEASED)
+    (asserts! (>= current-block deadline) ERR_VOTING_CLOSED)
+    
+    (map-set project-escrow project-id 
+      (merge escrow { locked: false })
+    )
+    (ok true)
+  )
+)
+
+(define-public (close-escrow (project-id uint))
+  (let
+    (
+      (escrow (unwrap! (map-get? project-escrow project-id) ERR_ESCROW_NOT_FOUND))
+      (total-amount (get total-amount escrow))
+      (released-amount (get released-amount escrow))
+      (remaining-amount (- total-amount released-amount))
+    )
+    (asserts! (is-admin) ERR_UNAUTHORIZED)
+    (asserts! (get escrow-active escrow) ERR_ESCROW_RELEASED)
+    
+    (var-set total-budget (+ (var-get total-budget) remaining-amount))
+    (map-set project-escrow project-id 
+      (merge escrow { escrow-active: false })
+    )
+    (ok remaining-amount)
+  )
+)
+
+(define-read-only (get-escrow-details (project-id uint))
+  (map-get? project-escrow project-id)
+)
+
+(define-read-only (get-escrow-remaining (project-id uint))
+  (match (map-get? project-escrow project-id)
+    escrow (- (get total-amount escrow) (get released-amount escrow))
+    u0
+  )
+)
+
+(define-read-only (is-escrow-unlocked (project-id uint))
+  (match (map-get? project-escrow project-id)
+    escrow (not (get locked escrow))
+    false
+  )
+)
