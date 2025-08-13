@@ -692,3 +692,349 @@
     false
   )
 )
+
+;; Budget Cycle Management System
+(define-constant ERR_CYCLE_NOT_FOUND (err u120))
+(define-constant ERR_CYCLE_ALREADY_EXISTS (err u121))
+(define-constant ERR_CYCLE_ACTIVE (err u122))
+(define-constant ERR_CYCLE_INACTIVE (err u123))
+(define-constant ERR_INVALID_CYCLE_DURATION (err u124))
+(define-constant ERR_CYCLE_NOT_ENDED (err u125))
+
+;; Cycle status constants
+(define-constant CYCLE_STATUS_PLANNING u1)
+(define-constant CYCLE_STATUS_ACTIVE u2)
+(define-constant CYCLE_STATUS_VOTING u3)
+(define-constant CYCLE_STATUS_FUNDING u4)
+(define-constant CYCLE_STATUS_COMPLETED u5)
+
+;; Current active cycle ID
+(define-data-var current-cycle-id uint u0)
+(define-data-var total-cycles uint u0)
+
+;; Budget cycle data structure
+(define-map budget-cycles uint
+  {
+    name: (string-ascii 50),
+    description: (string-ascii 200),
+    total-budget: uint,
+    allocated-budget: uint,
+    start-block: uint,
+    end-block: uint,
+    voting-start: uint,
+    voting-end: uint,
+    status: uint,
+    projects-count: uint,
+    total-votes: uint,
+    created-by: principal,
+    created-at: uint
+  }
+)
+
+;; Track projects by cycle
+(define-map cycle-projects
+  {
+    cycle-id: uint,
+    project-id: uint
+  }
+  {
+    included: bool
+  }
+)
+
+;; Track user participation per cycle
+(define-map cycle-participation
+  {
+    cycle-id: uint,
+    user: principal
+  }
+  {
+    proposals-submitted: uint,
+    votes-cast: uint,
+    projects-funded: uint,
+    participation-score: uint
+  }
+)
+
+;; Cycle statistics for analytics
+(define-map cycle-statistics uint
+  {
+    total-participants: uint,
+    budget-utilization: uint,
+    average-project-votes: uint,
+    success-rate: uint
+  }
+)
+
+;; Create a new budget cycle
+(define-public (create-budget-cycle 
+  (name (string-ascii 50)) 
+  (description (string-ascii 200)) 
+  (budget uint) 
+  (duration-blocks uint)
+  (voting-duration uint))
+  (let
+    (
+      (cycle-id (+ (var-get total-cycles) u1))
+      (current-block stacks-block-height)
+      (end-block (+ current-block duration-blocks))
+      (voting-start (+ current-block (/ duration-blocks u4))) ;; Voting starts at 25% of cycle
+      (voting-end (+ voting-start voting-duration))
+    )
+    (asserts! (is-admin) ERR_UNAUTHORIZED)
+    (asserts! (> budget u0) ERR_INVALID_AMOUNT)
+    (asserts! (> duration-blocks u100) ERR_INVALID_CYCLE_DURATION) ;; Minimum 100 blocks
+    (asserts! (< voting-duration duration-blocks) ERR_INVALID_CYCLE_DURATION)
+    (asserts! (< voting-end end-block) ERR_INVALID_CYCLE_DURATION)
+    
+    ;; Close current cycle if exists
+    (if (> (var-get current-cycle-id) u0)
+      (try! (close-current-cycle))
+      true
+    )
+    
+    ;; Create new cycle
+    (map-set budget-cycles cycle-id {
+      name: name,
+      description: description,
+      total-budget: budget,
+      allocated-budget: u0,
+      start-block: current-block,
+      end-block: end-block,
+      voting-start: voting-start,
+      voting-end: voting-end,
+      status: CYCLE_STATUS_PLANNING,
+      projects-count: u0,
+      total-votes: u0,
+      created-by: tx-sender,
+      created-at: current-block
+    })
+    
+    ;; Initialize cycle statistics
+    (map-set cycle-statistics cycle-id {
+      total-participants: u0,
+      budget-utilization: u0,
+      average-project-votes: u0,
+      success-rate: u0
+    })
+    
+    ;; Update global state
+    (var-set total-cycles cycle-id)
+    (var-set current-cycle-id cycle-id)
+    (var-set total-budget budget)
+    (var-set voting-open false) ;; Initially closed until cycle starts
+    
+    (ok cycle-id)
+  )
+)
+
+;; Activate the current cycle (transition from planning to active)
+(define-public (activate-cycle (cycle-id uint))
+  (let
+    (
+      (cycle (unwrap! (map-get? budget-cycles cycle-id) ERR_CYCLE_NOT_FOUND))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-admin) ERR_UNAUTHORIZED)
+    (asserts! (is-eq cycle-id (var-get current-cycle-id)) ERR_CYCLE_INACTIVE)
+    (asserts! (is-eq (get status cycle) CYCLE_STATUS_PLANNING) ERR_CYCLE_ACTIVE)
+    (asserts! (>= current-block (get start-block cycle)) ERR_VOTING_CLOSED)
+    
+    (map-set budget-cycles cycle-id 
+      (merge cycle { status: CYCLE_STATUS_ACTIVE })
+    )
+    (ok true)
+  )
+)
+
+;; Start voting phase for current cycle
+(define-public (start-cycle-voting (cycle-id uint))
+  (let
+    (
+      (cycle (unwrap! (map-get? budget-cycles cycle-id) ERR_CYCLE_NOT_FOUND))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-admin) ERR_UNAUTHORIZED)
+    (asserts! (is-eq cycle-id (var-get current-cycle-id)) ERR_CYCLE_INACTIVE)
+    (asserts! (is-eq (get status cycle) CYCLE_STATUS_ACTIVE) ERR_CYCLE_INACTIVE)
+    (asserts! (>= current-block (get voting-start cycle)) ERR_VOTING_CLOSED)
+    (asserts! (< current-block (get voting-end cycle)) ERR_VOTING_CLOSED)
+    
+    (map-set budget-cycles cycle-id 
+      (merge cycle { status: CYCLE_STATUS_VOTING })
+    )
+    (var-set voting-open true)
+    (ok true)
+  )
+)
+
+;; End voting phase and transition to funding
+(define-public (end-cycle-voting (cycle-id uint))
+  (let
+    (
+      (cycle (unwrap! (map-get? budget-cycles cycle-id) ERR_CYCLE_NOT_FOUND))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-admin) ERR_UNAUTHORIZED)
+    (asserts! (is-eq cycle-id (var-get current-cycle-id)) ERR_CYCLE_INACTIVE)
+    (asserts! (is-eq (get status cycle) CYCLE_STATUS_VOTING) ERR_CYCLE_INACTIVE)
+    (asserts! (>= current-block (get voting-end cycle)) ERR_VOTING_OPEN)
+    
+    (map-set budget-cycles cycle-id 
+      (merge cycle { status: CYCLE_STATUS_FUNDING })
+    )
+    (var-set voting-open false)
+    (ok true)
+  )
+)
+
+;; Close current cycle and finalize statistics
+(define-public (close-current-cycle)
+  (let
+    (
+      (cycle-id (var-get current-cycle-id))
+      (cycle (unwrap! (map-get? budget-cycles cycle-id) ERR_CYCLE_NOT_FOUND))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-admin) ERR_UNAUTHORIZED)
+    (asserts! (> cycle-id u0) ERR_CYCLE_NOT_FOUND)
+    (asserts! (>= current-block (get end-block cycle)) ERR_CYCLE_NOT_ENDED)
+    
+    ;; Calculate final statistics
+    (let
+      (
+        (cycle-total-budget (get total-budget cycle))
+        (cycle-allocated-budget (get allocated-budget cycle))
+        (budget-utilization (if (> cycle-total-budget u0) (/ (* cycle-allocated-budget u100) cycle-total-budget) u0))
+        (cycle-projects-count (get projects-count cycle))
+        (cycle-total-votes (get total-votes cycle))
+        (avg-votes (if (> cycle-projects-count u0) (/ cycle-total-votes cycle-projects-count) u0))
+      )
+      (map-set cycle-statistics cycle-id 
+        (merge (unwrap-panic (map-get? cycle-statistics cycle-id)) {
+          budget-utilization: budget-utilization,
+          average-project-votes: avg-votes,
+          success-rate: (if (> cycle-projects-count u0) (/ (* cycle-allocated-budget u100) cycle-total-budget) u0)
+        })
+      )
+    )
+    
+    ;; Mark cycle as completed
+    (map-set budget-cycles cycle-id 
+      (merge cycle { status: CYCLE_STATUS_COMPLETED })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Add project to current cycle
+(define-public (add-project-to-cycle (project-id uint))
+  (let
+    (
+      (cycle-id (var-get current-cycle-id))
+      (cycle (unwrap! (map-get? budget-cycles cycle-id) ERR_CYCLE_NOT_FOUND))
+      (project (unwrap! (map-get? projects project-id) ERR_PROJECT_NOT_FOUND))
+    )
+    (asserts! (> cycle-id u0) ERR_CYCLE_NOT_FOUND)
+    (asserts! (or (is-eq (get status cycle) CYCLE_STATUS_ACTIVE) 
+                 (is-eq (get status cycle) CYCLE_STATUS_VOTING)) ERR_CYCLE_INACTIVE)
+    
+    ;; Track project in cycle
+    (map-set cycle-projects 
+      { cycle-id: cycle-id, project-id: project-id }
+      { included: true }
+    )
+    
+    ;; Update cycle project count
+    (map-set budget-cycles cycle-id 
+      (merge cycle { projects-count: (+ (get projects-count cycle) u1) })
+    )
+    
+    ;; Update user participation
+    (unwrap-panic (update-user-participation cycle-id (get creator project) u1 u0 u0))
+    (ok true)
+  )
+)
+
+;; Update user participation in cycle
+(define-private (update-user-participation 
+  (cycle-id uint) 
+  (user principal) 
+  (proposals uint) 
+  (votes uint) 
+  (funded uint))
+  (let
+    (
+      (current-participation (default-to 
+        { proposals-submitted: u0, votes-cast: u0, projects-funded: u0, participation-score: u0 }
+        (map-get? cycle-participation { cycle-id: cycle-id, user: user })
+      ))
+    )
+    (map-set cycle-participation 
+      { cycle-id: cycle-id, user: user }
+      {
+        proposals-submitted: (+ (get proposals-submitted current-participation) proposals),
+        votes-cast: (+ (get votes-cast current-participation) votes),
+        projects-funded: (+ (get projects-funded current-participation) funded),
+        participation-score: (+ (get participation-score current-participation) proposals votes funded)
+      }
+    )
+    (ok true)
+  )
+)
+
+;; Read-only functions for cycle management
+(define-read-only (get-current-cycle-id)
+  (var-get current-cycle-id)
+)
+
+(define-read-only (get-cycle-details (cycle-id uint))
+  (map-get? budget-cycles cycle-id)
+)
+
+(define-read-only (get-cycle-statistics (cycle-id uint))
+  (map-get? cycle-statistics cycle-id)
+)
+
+(define-read-only (get-user-cycle-participation (cycle-id uint) (user principal))
+  (map-get? cycle-participation { cycle-id: cycle-id, user: user })
+)
+
+(define-read-only (is-project-in-cycle (cycle-id uint) (project-id uint))
+  (default-to false 
+    (get included (map-get? cycle-projects { cycle-id: cycle-id, project-id: project-id }))
+  )
+)
+
+(define-read-only (get-cycle-status (cycle-id uint))
+  (match (map-get? budget-cycles cycle-id)
+    cycle (get status cycle)
+    u0
+  )
+)
+
+(define-read-only (is-cycle-voting-active (cycle-id uint))
+  (let
+    (
+      (cycle (map-get? budget-cycles cycle-id))
+      (current-block stacks-block-height)
+    )
+    (match cycle
+      cycle-data 
+        (and 
+          (is-eq (get status cycle-data) CYCLE_STATUS_VOTING)
+          (>= current-block (get voting-start cycle-data))
+          (< current-block (get voting-end cycle-data))
+        )
+      false
+    )
+  )
+)
+
+(define-read-only (get-total-cycles)
+  (var-get total-cycles)
+)
+
+
+
